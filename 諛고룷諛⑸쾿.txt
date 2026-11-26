@@ -1,0 +1,9 @@
+WUNNAM KART V13 — Render 배포용
+1. GitHub(https://github.com/new)에서 새 저장소를 생성합니다. 예: wunnam-kart. Private 선택 가능.
+2. 압축을 푼 뒤 저장소의 Add file > Upload files에서 index.html, server.py, requirements.txt, render.yaml을 저장소 최상위에 업로드하고 Commit changes를 누릅니다. ZIP 자체를 업로드하지 마세요.
+3. https://dashboard.render.com 에서 GitHub 계정으로 로그인합니다.
+4. New > Web Service > Git Provider에서 저장소 연결. 필요 시 GitHub 접근 권한 승인.
+5. Name: wunnam-kart (중복 시 다른 이름), Language: Python 3, Branch: main, Root Directory: 비워 둠, Build Command: pip install -r requirements.txt, Start Command: python server.py, Instance Type: Free. Region은 선택 가능한 가까운 지역으로 설정합니다.
+6. Deploy Web Service. Live 상태가 되면 Render가 제공한 https://...onrender.com 주소를 교사와 학생 모두 사용합니다.
+7. 교사가 방 만들기 > 학생들은 같은 주소에서 방 코드 입력 > 교사가 시간 설정 후 시작.
+무료 서비스는 15분간 요청이 없으면 잠들 수 있고 첫 접속 시 약 1분 소요될 수 있습니다. 재시작 시 방 정보는 사라집니다. 학생은 실명 대신 별명을 사용하세요. 실제 학교 태블릿과 외부 네트워크에서 테스트 필요.
