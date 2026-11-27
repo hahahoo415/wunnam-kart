@@ -19,10 +19,10 @@ async def ws_handler(req):
             if typ=='create':
                 code=''.join(secrets.choice(string.ascii_uppercase+string.digits) for _ in range(6))
                 while code in rooms: code=secrets.token_hex(3).upper()
-                rooms[code]=dict(code=code,host=pid,players={},at=0,rank=0,duration=0,ended=False)
+                rooms[code]=dict(code=code,host=pid,players={},at=0,rank=0,duration=0,ended=False,pending={})
             else: code=str(m.get('room','')).upper()
             target=rooms.get(code)
-            if not target or target['at'] or len(target['players'])>=20:
+            if not target or target['at'] or len(target['players'])>=30:
                 await ws.send_json(dict(type='error',message='입장 불가: 방 코드, 인원 또는 경기 상태 확인'));continue
             try: i=max(0,min(7,int(m.get('i',0))))
             except (ValueError,TypeError): i=0
@@ -35,6 +35,7 @@ async def ws_handler(req):
             except (ValueError,TypeError): d=0
             r['duration']=max(60,min(1200,d)) if d else 0
             r['ended']=False
+            r['pending'].clear()
             for j,p in enumerate(r['players'].values()):
                 p.update(p=0,rank=0,last_attack=0,lane=[-.65,-.22,.22,.65][j%4])
             await broadcast(r,'start',now=now(),at=r['at'],duration=r['duration'])
@@ -51,8 +52,19 @@ async def ws_handler(req):
                     await ws.send_json(dict(type='attackResult',kind=kind,ok=False));continue
                 await ws.send_json(dict(type='attackResult',kind=kind,ok=True))
             for q in targets:
-                try: await q['ws'].send_json(dict(type='attack',kind=kind,owner=pid))
+                try:
+                    token=secrets.token_hex(8)
+                    r['pending'][token]=(pid,q['id'],kind,t)
+                    await q['ws'].send_json(dict(type='attack',kind=kind,owner=pid,token=token))
                 except (ConnectionError,RuntimeError):pass
+        elif r and typ=='hitAck':
+            token=str(m.get('token','')); pending=r['pending'].get(token)
+            if pending and pending[1]==pid and now()-pending[3]<5000:
+                r['pending'].pop(token,None)
+                owner=r['players'].get(pending[0]); victim=r['players'][pid]
+                if owner:
+                    try: await owner['ws'].send_json(dict(type='hitCam',kind=pending[2],blocked=bool(m.get('blocked')),target={k:victim[k] for k in ('id','name','i')}))
+                    except (ConnectionError,RuntimeError): pass
         elif r and typ=='banana' and r['at'] and now()>=r['at']:
             player=r['players'][pid]
             try:
@@ -85,6 +97,7 @@ async def tick(app):
         await asyncio.sleep(.1)
         for r in list(rooms.values()):
             if r['at']:
+                r['pending']={k:v for k,v in r['pending'].items() if now()-v[3]<5000}
                 if r['duration'] and not r['ended'] and now()>=r['at']+r['duration']*1000:
                     r['ended']=True
                     for j,p in enumerate(sorted(r['players'].values(),key=lambda p:-p['p']),1):p['rank']=j
