@@ -45,7 +45,11 @@ async def ws_handler(req):
             others=[q for q in r['players'].values() if q['id']!=pid and not q['rank']]
             if kind=='fog': targets=[q for q in others if q['p']<player['p']]
             elif kind=='lightning':targets=others
-            else:targets=sorted([q for q in others if q['p']>player['p']],key=lambda q:q['p'])[:1]
+            else:
+                targets=[q for q in others if q['id']==m.get('target') and 0<q['p']-player['p']<=700]
+                if not targets:
+                    await ws.send_json(dict(type='attackResult',kind=kind,ok=False));continue
+                await ws.send_json(dict(type='attackResult',kind=kind,ok=True))
             for q in targets:
                 try: await q['ws'].send_json(dict(type='attack',kind=kind,owner=pid))
                 except (ConnectionError,RuntimeError):pass
