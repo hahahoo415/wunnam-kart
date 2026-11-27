@@ -36,8 +36,19 @@ async def ws_handler(req):
             r['duration']=max(60,min(1200,d)) if d else 0
             r['ended']=False
             for j,p in enumerate(r['players'].values()):
-                p.update(p=0,rank=0,lane=[-.65,-.22,.22,.65][j%4])
+                p.update(p=0,rank=0,last_attack=0,lane=[-.65,-.22,.22,.65][j%4])
             await broadcast(r,'start',now=now(),at=r['at'],duration=r['duration'])
+        elif r and typ=='attack' and r['at'] and now()>=r['at'] and not r['ended']:
+            player=r['players'][pid];kind=m.get('kind');t=now()
+            if player['rank'] or kind not in ('missile','fog','water','lightning') or t-player.get('last_attack',0)<1400:continue
+            player['last_attack']=t
+            others=[q for q in r['players'].values() if q['id']!=pid and not q['rank']]
+            if kind=='fog': targets=[q for q in others if q['p']<player['p']]
+            elif kind=='lightning':targets=others
+            else:targets=sorted([q for q in others if q['p']>player['p']],key=lambda q:q['p'])[:1]
+            for q in targets:
+                try: await q['ws'].send_json(dict(type='attack',kind=kind,owner=pid))
+                except (ConnectionError,RuntimeError):pass
         elif r and typ=='banana' and r['at'] and now()>=r['at']:
             player=r['players'][pid]
             try:
