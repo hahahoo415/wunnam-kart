@@ -3,13 +3,26 @@ import asyncio, json, secrets, string, time, math, os
 from pathlib import Path
 rooms={}
 def now(): return int(time.time()*1000)
+MAX_ROOM=30
+MAX_PLAYERS=150
+MAX_ROOMS=15
+SNAPSHOT_INTERVAL=.15
+async def deliver(ws, payload):
+    if ws is None or ws.closed: return
+    try:
+        await asyncio.wait_for(ws.send_str(payload), timeout=.6)
+    except (ConnectionError, RuntimeError, asyncio.TimeoutError):
+        if not ws.closed:
+            asyncio.create_task(ws.close(code=1013, message=b'Slow connection'))
 async def broadcast(r,typ,**kw):
-    players=[{k:v for k,v in p.items() if k not in ('ws','token','saved')} for p in r['players'].values()]
-    for p in list(r['players'].values()):
-        try:
-            if p['ws'] is None: continue
-            await p['ws'].send_json(dict(type=typ,players=players,id=p['id'],host=r['host'],room=r['code'],paused=r.get('paused',0),allow=r.get('allow',False),at=r['at'],duration=r['duration'],track=r.get('track','village'),now=now(),**{k:v for k,v in kw.items() if k not in ('at','duration','now')}))
-        except (ConnectionError,RuntimeError,AttributeError): pass
+    players=[{k:v for k,v in p.items() if k not in ('ws','token','saved','last_state')} for p in r['players'].values()]
+    base=dict(type=typ,players=players,host=r['host'],room=r['code'],paused=r.get('paused',0),allow=r.get('allow',False),at=r['at'],duration=r['duration'],track=r.get('track','village'),now=now(),**{k:v for k,v in kw.items() if k not in ('at','duration','now')})
+    clients=[p for p in r['players'].values() if p['ws'] is not None and not p['ws'].closed]
+    if typ=='snapshot':
+        payload=json.dumps(base,ensure_ascii=False,separators=(',',':'))
+        await asyncio.gather(*(deliver(p['ws'],payload) for p in clients))
+    else:
+        await asyncio.gather(*(deliver(p['ws'],json.dumps(dict(base,id=p['id']),ensure_ascii=False,separators=(',',':'))) for p in clients))
 async def index(req): return web.FileResponse(Path(__file__).with_name('index.html'))
 async def ws_handler(req):
     ws=web.WebSocketResponse(heartbeat=20,max_msg_size=4096);await ws.prepare(req);r=None;pid=secrets.token_hex(8)
@@ -19,13 +32,15 @@ async def ws_handler(req):
         except (ValueError,AttributeError): continue
         if typ in ('create','join') and r is None:
             if typ=='create':
+                if len(rooms)>=MAX_ROOMS or sum(len(q['players']) for q in rooms.values())>=MAX_PLAYERS:
+                    await ws.send_json(dict(type='error',message='서버 정원 초과: 다른 방 종료 후 다시 시도해 주세요.'));continue
                 code=''.join(secrets.choice(string.ascii_uppercase+string.digits) for _ in range(6))
                 while code in rooms: code=secrets.token_hex(3).upper()
                 rooms[code]=dict(code=code,host=pid,players={},at=0,rank=0,duration=0,ended=False,pending={},paused=0,allow=False,track='village')
             else: code=str(m.get('room','')).upper()
             target=rooms.get(code)
             resume=next((p for p in target['players'].values() if p['token']==m.get('token')),None) if target and m.get('token') else None
-            if not target or (not resume and (len(target['players'])>=30 or (target['at'] and (not target['allow'] or target['ended'])))):
+            if not target or (not resume and (len(target['players'])>=MAX_ROOM or sum(len(q['players']) for q in rooms.values())>=MAX_PLAYERS or (target['at'] and (not target['allow'] or target['ended'])))):
                 await ws.send_json(dict(type='error',message='입장 불가: 방 코드, 인원 또는 경기 상태 확인'));continue
             try: i=max(0,min(7,int(m.get('i',0))))
             except (ValueError,TypeError): i=0
@@ -35,7 +50,7 @@ async def ws_handler(req):
                 if old and old is not ws: await old.close()
             else: r['players'][pid]=dict(id=pid,name=str(m.get('name') or 'Racer')[:16],i=i,p=0,lane=0,rank=0,ws=ws,token=secrets.token_hex(24),saved={})
             p=r['players'][pid]
-            await ws.send_json(dict(type='session',token=p['token'],id=pid,room=r['code'],host=r['host'],players=[{k:v for k,v in q.items() if k not in ('ws','token','saved')} for q in r['players'].values()],at=r['at'],now=now(),duration=r['duration'],track=r['track'],paused=r['paused'],ended=r['ended'],saved=p['saved'],allow=r['allow']))
+            await ws.send_json(dict(type='session',token=p['token'],id=pid,room=r['code'],host=r['host'],players=[{k:v for k,v in q.items() if k not in ('ws','token','saved','last_state')} for q in r['players'].values()],at=r['at'],now=now(),duration=r['duration'],track=r['track'],paused=r['paused'],ended=r['ended'],saved=p['saved'],allow=r['allow']))
             if not r['at']: await broadcast(r,'lobby')
         elif r and r['host']==pid and typ in ('pause','resume','stop','allow'):
             if typ=='allow': r['allow']=bool(m.get('allow'))
@@ -100,6 +115,9 @@ async def ws_handler(req):
         elif r and not r['paused'] and typ=='state' and r['at'] and now()>=r['at']-100:
             p=r['players'][pid]
             if p['rank'] or r['ended']: continue
+            t=now()
+            if t-p.get('last_state',0)<45: continue
+            p['last_state']=t
             try: z=float(m['p']);lane=float(m['lane']);assert math.isfinite(z) and math.isfinite(lane)
             except (ValueError,TypeError,KeyError,AssertionError): continue
             p['p']=max(p['p'],min(200000 if r['duration'] else 4800,z));p['lane']=max(-1.35,min(1.35,lane))
@@ -109,22 +127,31 @@ async def ws_handler(req):
         r['players'][pid]['ws']=None
         r['players'][pid]['disconnected']=now()
     return ws
+async def room_tick(r):
+    t=now()
+    # Retain disconnected players in a live race for reconnection; reclaim idle lobbies.
+    if not r['at']:
+        for pid,p in list(r['players'].items()):
+            if pid!=r['host'] and p['ws'] is None and t-p.get('disconnected',t)>120000:
+                r['players'].pop(pid,None)
+    if not any(p['ws'] is not None and not p['ws'].closed for p in r['players'].values()) and all(t-p.get('disconnected',t)>300000 for p in r['players'].values()):
+        rooms.pop(r['code'],None);return
+    if r['at']:
+        r['pending']={k:v for k,v in r['pending'].items() if t-v[3]<5000}
+        if r['duration'] and not r['ended'] and not r['paused'] and t>=r['at']+r['duration']*1000:
+            r['ended']=True
+            for j,p in enumerate(sorted(r['players'].values(),key=lambda p:-p['p']),1):p['rank']=j
+        await broadcast(r,'snapshot',ended=r['ended'])
 async def tick(app):
     while True:
-        await asyncio.sleep(.1)
-        for r in list(rooms.values()):
-            if not any(p['ws'] is not None for p in r['players'].values()) and all(now()-p.get('disconnected',now())>1800000 for p in r['players'].values()):
-                rooms.pop(r['code'],None);continue
-            if r['at']:
-                r['pending']={k:v for k,v in r['pending'].items() if now()-v[3]<5000}
-                if r['duration'] and not r['ended'] and not r['paused'] and now()>=r['at']+r['duration']*1000:
-                    r['ended']=True
-                    for j,p in enumerate(sorted(r['players'].values(),key=lambda p:-p['p']),1):p['rank']=j
-                await broadcast(r,'snapshot',ended=r['ended'])
+        await asyncio.sleep(SNAPSHOT_INTERVAL)
+        await asyncio.gather(*(room_tick(r) for r in list(rooms.values())))
 async def background(app):
     task=asyncio.create_task(tick(app));yield;task.cancel()
     try:await task
     except asyncio.CancelledError:pass
 async def health(req): return web.Response(text='OK')
-app=web.Application();app.router.add_get('/health',health);app.router.add_get('/',index);app.router.add_get('/ws',ws_handler);app.cleanup_ctx.append(background)
+async def status(req):
+    return web.json_response(dict(version=26,rooms=len(rooms),connected=sum(p['ws'] is not None and not p['ws'].closed for r in rooms.values() for p in r['players'].values()),reserved=sum(len(r['players']) for r in rooms.values()),capacity=MAX_PLAYERS,room_capacity=MAX_ROOM))
+app=web.Application();app.router.add_get('/health',health);app.router.add_get('/status',status);app.router.add_get('/',index);app.router.add_get('/ws',ws_handler);app.cleanup_ctx.append(background)
 if __name__=='__main__':web.run_app(app,host='0.0.0.0',port=int(os.getenv('PORT','8080')))
