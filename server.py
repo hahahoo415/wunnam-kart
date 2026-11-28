@@ -16,7 +16,7 @@ async def deliver(ws, payload):
             asyncio.create_task(ws.close(code=1013, message=b'Slow connection'))
 async def broadcast(r,typ,**kw):
     players=[{k:v for k,v in p.items() if k not in ('ws','token','saved','last_state')} for p in r['players'].values()]
-    base=dict(type=typ,players=players,host=r['host'],room=r['code'],paused=r.get('paused',0),allow=r.get('allow',False),at=r['at'],duration=r['duration'],track=r.get('track','village'),now=now(),**{k:v for k,v in kw.items() if k not in ('at','duration','now')})
+    base=dict(type=typ,players=players,host=r['host'],room=r['code'],paused=r.get('paused',0),allow=r.get('allow',False),at=r['at'],duration=r['duration'],laps=r['laps'],deadline=r['deadline'],track=r.get('track','village'),now=now(),**{k:v for k,v in kw.items() if k not in ('at','duration','now')})
     clients=[p for p in r['players'].values() if p['ws'] is not None and not p['ws'].closed]
     if typ=='snapshot':
         payload=json.dumps(base,ensure_ascii=False,separators=(',',':'))
@@ -36,7 +36,7 @@ async def ws_handler(req):
                     await ws.send_json(dict(type='error',message='서버 정원 초과: 다른 방 종료 후 다시 시도해 주세요.'));continue
                 code=''.join(secrets.choice(string.ascii_uppercase+string.digits) for _ in range(6))
                 while code in rooms: code=secrets.token_hex(3).upper()
-                rooms[code]=dict(code=code,host=pid,players={},at=0,rank=0,duration=0,ended=False,pending={},paused=0,allow=False,track='village')
+                rooms[code]=dict(code=code,host=pid,players={},at=0,rank=0,duration=0,laps=2,deadline=0,ended=False,pending={},paused=0,allow=False,track='village')
             else: code=str(m.get('room','')).upper()
             target=rooms.get(code)
             resume=next((p for p in target['players'].values() if p['token']==m.get('token')),None) if target and m.get('token') else None
@@ -50,13 +50,13 @@ async def ws_handler(req):
                 if old and old is not ws: await old.close()
             else: r['players'][pid]=dict(id=pid,name=str(m.get('name') or 'Racer')[:16],i=i,p=0,lane=0,rank=0,ws=ws,token=secrets.token_hex(24),saved={})
             p=r['players'][pid]
-            await ws.send_json(dict(type='session',token=p['token'],id=pid,room=r['code'],host=r['host'],players=[{k:v for k,v in q.items() if k not in ('ws','token','saved','last_state')} for q in r['players'].values()],at=r['at'],now=now(),duration=r['duration'],track=r['track'],paused=r['paused'],ended=r['ended'],saved=p['saved'],allow=r['allow']))
+            await ws.send_json(dict(type='session',token=p['token'],id=pid,room=r['code'],host=r['host'],players=[{k:v for k,v in q.items() if k not in ('ws','token','saved','last_state')} for q in r['players'].values()],at=r['at'],now=now(),duration=r['duration'],laps=r['laps'],deadline=r['deadline'],track=r['track'],paused=r['paused'],ended=r['ended'],saved=p['saved'],allow=r['allow']))
             if not r['at']: await broadcast(r,'lobby')
         elif r and r['host']==pid and typ in ('pause','resume','stop','allow'):
             if typ=='allow': r['allow']=bool(m.get('allow'))
             elif r['at'] and not r['ended']:
                 if typ=='pause' and not r['paused']: r['paused']=now()
-                elif typ=='resume' and r['paused']: r['at']+=now()-r['paused']+3000;r['paused']=0
+                elif typ=='resume' and r['paused']: r['at']+=now()-r['paused']+3000;r['deadline']+=now()-r['paused']+3000 if r['deadline'] else 0;r['paused']=0
                 elif typ=='stop':
                     r['ended']=True;r['paused']=0
                     for j,q in enumerate(sorted(r['players'].values(),key=lambda q:(q['rank'] or 999,-q['p'])),1):q['rank']=j
@@ -68,10 +68,12 @@ async def ws_handler(req):
             try: d=int(m.get('duration',0))
             except (ValueError,TypeError): d=0
             r['duration']=max(60,min(1200,d)) if d else 0
+            r['laps']=m.get('laps',2) if m.get('laps',2) in (1,2,3,5) else 2
+            r['deadline']=0
             r['ended']=False;r['paused']=0
             r['pending'].clear()
             for j,p in enumerate(r['players'].values()):
-                p.update(p=0,rank=0,last_attack=0,saved={},lane=[-.65,-.22,.22,.65][j%4])
+                p.update(p=0,rank=0,finish_ms=None,last_attack=0,saved={},lane=[-.65,-.22,.22,.65][j%4])
             await broadcast(r,'start',now=now(),at=r['at'],duration=r['duration'])
         elif r and not r['paused'] and typ=='attack' and r['at'] and now()>=r['at'] and not r['ended']:
             player=r['players'][pid];kind=m.get('kind');t=now()
@@ -116,13 +118,16 @@ async def ws_handler(req):
             p=r['players'][pid]
             if p['rank'] or r['ended']: continue
             t=now()
-            if t-p.get('last_state',0)<45: continue
+            if t-p.get('last_state',0)<45 and not (not r['duration'] and m.get('finish')): continue
             p['last_state']=t
             try: z=float(m['p']);lane=float(m['lane']);assert math.isfinite(z) and math.isfinite(lane)
             except (ValueError,TypeError,KeyError,AssertionError): continue
-            p['p']=max(p['p'],min(200000 if r['duration'] else 4800,z));p['lane']=max(-1.35,min(1.35,lane))
+            p['p']=max(p['p'],min(250000 if r['duration'] else 2400*r['laps'],z));p['lane']=max(-1.35,min(1.35,lane))
             p['saved']={k:m[k] for k in ('correct','attempts','boosts','charge') if isinstance(m.get(k),(int,float)) and math.isfinite(m[k])}
-            if not r['duration'] and p['p']>=4800:r['rank']+=1;p['rank']=r['rank']
+            if not r['duration'] and p['p']>=2400*r['laps']:
+                r['rank']+=1;p['rank']=r['rank'];p['finish_ms']=max(0,t-r['at'])
+                if not r['deadline']:r['deadline']=t+60000
+                if all(q['rank'] for q in r['players'].values()):r['ended']=True
     if r and pid in r['players'] and r['players'][pid]['ws'] is ws:
         r['players'][pid]['ws']=None
         r['players'][pid]['disconnected']=now()
@@ -138,9 +143,9 @@ async def room_tick(r):
         rooms.pop(r['code'],None);return
     if r['at']:
         r['pending']={k:v for k,v in r['pending'].items() if t-v[3]<5000}
-        if r['duration'] and not r['ended'] and not r['paused'] and t>=r['at']+r['duration']*1000:
+        if not r['ended'] and not r['paused'] and ((r['duration'] and t>=r['at']+r['duration']*1000) or (not r['duration'] and r['deadline'] and t>=r['deadline'])):
             r['ended']=True
-            for j,p in enumerate(sorted(r['players'].values(),key=lambda p:-p['p']),1):p['rank']=j
+            for j,p in enumerate(sorted(r['players'].values(),key=lambda p:(p['rank'] or 999,-p['p'])),1):p['rank']=j
         await broadcast(r,'snapshot',ended=r['ended'])
 async def tick(app):
     while True:
@@ -152,6 +157,6 @@ async def background(app):
     except asyncio.CancelledError:pass
 async def health(req): return web.Response(text='OK')
 async def status(req):
-    return web.json_response(dict(version=26,rooms=len(rooms),connected=sum(p['ws'] is not None and not p['ws'].closed for r in rooms.values() for p in r['players'].values()),reserved=sum(len(r['players']) for r in rooms.values()),capacity=MAX_PLAYERS,room_capacity=MAX_ROOM))
+    return web.json_response(dict(version=27,rooms=len(rooms),connected=sum(p['ws'] is not None and not p['ws'].closed for r in rooms.values() for p in r['players'].values()),reserved=sum(len(r['players']) for r in rooms.values()),capacity=MAX_PLAYERS,room_capacity=MAX_ROOM))
 app=web.Application();app.router.add_get('/health',health);app.router.add_get('/status',status);app.router.add_get('/',index);app.router.add_get('/ws',ws_handler);app.cleanup_ctx.append(background)
 if __name__=='__main__':web.run_app(app,host='0.0.0.0',port=int(os.getenv('PORT','8080')))
