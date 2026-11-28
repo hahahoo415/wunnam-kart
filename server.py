@@ -8,7 +8,7 @@ async def broadcast(r,typ,**kw):
     for p in list(r['players'].values()):
         try:
             if p['ws'] is None: continue
-            await p['ws'].send_json(dict(type=typ,players=players,id=p['id'],host=r['host'],room=r['code'],paused=r.get('paused',0),allow=r.get('allow',False),at=r['at'],duration=r['duration'],now=now(),**{k:v for k,v in kw.items() if k not in ('at','duration','now')}))
+            await p['ws'].send_json(dict(type=typ,players=players,id=p['id'],host=r['host'],room=r['code'],paused=r.get('paused',0),allow=r.get('allow',False),at=r['at'],duration=r['duration'],track=r.get('track','village'),now=now(),**{k:v for k,v in kw.items() if k not in ('at','duration','now')}))
         except (ConnectionError,RuntimeError,AttributeError): pass
 async def index(req): return web.FileResponse(Path(__file__).with_name('index.html'))
 async def ws_handler(req):
@@ -21,7 +21,7 @@ async def ws_handler(req):
             if typ=='create':
                 code=''.join(secrets.choice(string.ascii_uppercase+string.digits) for _ in range(6))
                 while code in rooms: code=secrets.token_hex(3).upper()
-                rooms[code]=dict(code=code,host=pid,players={},at=0,rank=0,duration=0,ended=False,pending={},paused=0,allow=False)
+                rooms[code]=dict(code=code,host=pid,players={},at=0,rank=0,duration=0,ended=False,pending={},paused=0,allow=False,track='village')
             else: code=str(m.get('room','')).upper()
             target=rooms.get(code)
             resume=next((p for p in target['players'].values() if p['token']==m.get('token')),None) if target and m.get('token') else None
@@ -35,7 +35,7 @@ async def ws_handler(req):
                 if old and old is not ws: await old.close()
             else: r['players'][pid]=dict(id=pid,name=str(m.get('name') or 'Racer')[:16],i=i,p=0,lane=0,rank=0,ws=ws,token=secrets.token_hex(24),saved={})
             p=r['players'][pid]
-            await ws.send_json(dict(type='session',token=p['token'],id=pid,room=r['code'],host=r['host'],players=[{k:v for k,v in q.items() if k not in ('ws','token','saved')} for q in r['players'].values()],at=r['at'],now=now(),duration=r['duration'],paused=r['paused'],ended=r['ended'],saved=p['saved'],allow=r['allow']))
+            await ws.send_json(dict(type='session',token=p['token'],id=pid,room=r['code'],host=r['host'],players=[{k:v for k,v in q.items() if k not in ('ws','token','saved')} for q in r['players'].values()],at=r['at'],now=now(),duration=r['duration'],track=r['track'],paused=r['paused'],ended=r['ended'],saved=p['saved'],allow=r['allow']))
             if not r['at']: await broadcast(r,'lobby')
         elif r and r['host']==pid and typ in ('pause','resume','stop','allow'):
             if typ=='allow': r['allow']=bool(m.get('allow'))
@@ -47,6 +47,7 @@ async def ws_handler(req):
                     for j,q in enumerate(sorted(r['players'].values(),key=lambda q:(q['rank'] or 999,-q['p'])),1):q['rank']=j
             await broadcast(r,'control',ended=r['ended'])
         elif r and r['host']==pid and ((typ=='start' and not r['at']) or (typ=='rematch' and r['at'] and all(p['rank'] for p in r['players'].values()))):
+            r['track']=m.get('track') if m.get('track') in ('village','ice','santa') else r.get('track','village')
             r['at']=now()+4000
             r['rank']=0
             try: d=int(m.get('duration',0))
