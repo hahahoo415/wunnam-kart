@@ -65,7 +65,7 @@ async def ws_handler(req):
             if kind=='fog': targets=[q for q in others if q['p']<player['p']]
             elif kind=='lightning':targets=others
             else:
-                targets=[q for q in others if q['id']==m.get('target') and 0<q['p']-player['p']<=700]
+                targets=[q for q in others if q['id']==m.get('target') and 0<q['p']-player['p']<=(1200 if kind=='missile' else 700)]
                 if not targets:
                     await ws.send_json(dict(type='attackResult',kind=kind,ok=False));continue
                 await ws.send_json(dict(type='attackResult',kind=kind,ok=True))
